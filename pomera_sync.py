@@ -226,8 +226,10 @@ class Sync(object):
         self.p_newline = args.pomera_newline
         self.ignore = set(DEFAULT_IGNORE) | set(
             x for x in args.ignore.split(",") if x)
+        self.rename_detect = not args.no_rename_detect
+        self.rename_threshold = args.rename_threshold
         self.stats = {"new": 0, "update": 0, "merge": 0,
-                      "conflict": 0, "delete": 0, "skip": 0}
+                      "conflict": 0, "delete": 0, "skip": 0, "rename": 0}
 
     # ---- paths
 
@@ -306,6 +308,12 @@ class Sync(object):
         ensure_dir(os.path.dirname(dest))
         shutil.move(path, dest)
 
+    def move(self, src, dst):
+        if self.dry or not os.path.exists(src):
+            return
+        ensure_dir(os.path.dirname(dst))
+        shutil.move(src, dst)
+
     def conflict_copy(self, key, is_text, side, content):
         """採用されなかった方を .conflict として残す。"""
         if self.dry:
@@ -348,6 +356,120 @@ class Sync(object):
                 entry[side] = True
         return table, dupes
 
+    # ---- rename / move detection
+
+    def _content_or_none(self, reader, key, is_text):
+        try:
+            return reader(key, is_text)
+        except (OSError, ValueError):
+            return None
+
+    def similarity(self, a, b, is_text):
+        if a is None or b is None:
+            return 0.0
+        if a == b:
+            return 1.0
+        if not is_text:
+            return 0.0
+        la, lb = norm(a).split("\n"), norm(b).split("\n")
+        sm = difflib.SequenceMatcher(None, la, lb, autojunk=False)
+        if sm.real_quick_ratio() < self.rename_threshold:
+            return 0.0
+        return sm.ratio()
+
+    def detect_renames(self, table):
+        """消えたファイルと増えたファイルを内容で突き合わせ、移動として扱う。
+
+        - gone : ベースにあり、その側から消えた
+        - born : ベースになく、その側に現れた
+        同じ「側」の gone と born の内容が一致（または閾値以上に類似）すれば
+        リネーム／移動とみなし、反対側とベースを同じ名前に付け替える。
+        """
+        buckets = {"pomera": ([], []), "vault": ([], []), "both": ([], [])}
+
+        for key, info in list(table.items()):
+            t = info["is_text"]
+            has_p = os.path.exists(self.p_path(key, t))
+            has_v = os.path.exists(self.v_path(key, t))
+            has_b = os.path.exists(self.b_path(key, t))
+            if has_b and not has_p and has_v:
+                buckets["pomera"][0].append(key)
+            elif has_b and has_p and not has_v:
+                buckets["vault"][0].append(key)
+            elif has_b and not has_p and not has_v:
+                buckets["both"][0].append(key)
+            elif not has_b and has_p and not has_v:
+                buckets["pomera"][1].append(key)
+            elif not has_b and not has_p and has_v:
+                buckets["vault"][1].append(key)
+            elif not has_b and has_p and has_v:
+                buckets["both"][1].append(key)
+
+        for side in ("pomera", "vault", "both"):
+            gone, born = buckets[side]
+            if not gone or not born:
+                continue
+            exact_only = (len(gone) * len(born)) > 2000
+
+            reader = self.read_p if side != "vault" else self.read_v
+            gone_data = {}
+            for k in gone:
+                gone_data[k] = self._content_or_none(
+                    self.read_b, k, table[k]["is_text"])
+            born_data = {}
+            for k in born:
+                born_data[k] = self._content_or_none(
+                    reader, k, table[k]["is_text"])
+
+            pairs = []
+            for gk in gone:
+                for bk in born:
+                    if table[gk]["is_text"] != table[bk]["is_text"]:
+                        continue
+                    is_text = table[gk]["is_text"]
+                    if exact_only:
+                        score = 1.0 if (gone_data[gk] is not None
+                                        and gone_data[gk] == born_data[bk]) \
+                            else 0.0
+                    else:
+                        score = self.similarity(
+                            gone_data[gk], born_data[bk], is_text)
+                    if score >= self.rename_threshold:
+                        pairs.append((score, gk, bk))
+
+            pairs.sort(key=lambda x: -x[0])
+            used_g, used_b = set(), set()
+            for score, gk, bk in pairs:
+                if gk in used_g or bk in used_b:
+                    continue
+                used_g.add(gk)
+                used_b.add(bk)
+                self.apply_rename(side, gk, bk, table, score)
+
+    def apply_rename(self, side, old_key, new_key, table, score):
+        is_text = table[old_key]["is_text"]
+        old_name = key_to_name(old_key, is_text, "vault")
+        new_name = key_to_name(new_key, is_text, "vault")
+        kind = "移動" if score >= 1.0 else "移動+編集"
+
+        if side == "pomera":
+            log("R  %s（ポメラ側）→ vault も追随: %s -> %s"
+                % (kind, old_name, new_name))
+            self.move(self.v_path(old_key, is_text),
+                      self.v_path(new_key, is_text))
+        elif side == "vault":
+            log("R  %s（vault側）→ ポメラ も追随: %s -> %s"
+                % (kind, old_name, new_name))
+            self.move(self.p_path(old_key, is_text),
+                      self.p_path(new_key, is_text))
+        else:
+            log("R  %s（両側）: %s -> %s" % (kind, old_name, new_name))
+
+        self.move(self.b_path(old_key, is_text),
+                  self.b_path(new_key, is_text))
+        table.pop(old_key, None)
+        self.stats["rename"] += 1
+
     def run(self):
         ensure_dir(self.base_dir)
         table, dupes = self.collect()
@@ -361,15 +483,21 @@ class Sync(object):
             key, is_text = split_key(rel)
             table.setdefault(key, {"is_text": is_text})
 
+        if self.rename_detect and not self.dry:
+            self.detect_renames(table)
+        elif self.rename_detect and self.dry:
+            # dry-run では実際に動かさないので検出結果の表示のみ
+            self.detect_renames(dict(table))
+
         for key in sorted(table):
             self.handle(key, table[key])
 
         log("")
         log("--- 結果 ---")
-        log("新規:%d  更新:%d  マージ:%d  衝突:%d  削除:%d  スキップ:%d"
+        log("新規:%d  更新:%d  マージ:%d  移動:%d  衝突:%d  削除:%d  スキップ:%d"
             % (self.stats["new"], self.stats["update"], self.stats["merge"],
-               self.stats["conflict"], self.stats["delete"],
-               self.stats["skip"]))
+               self.stats["rename"], self.stats["conflict"],
+               self.stats["delete"], self.stats["skip"]))
         if self.dry:
             log("(dry-run のため実際の書き込みは行っていません)")
         if self.stats["conflict"]:
@@ -494,6 +622,10 @@ def main(argv=None):
                     help="ポメラ側の読み込み時に試す文字コード（カンマ区切り）")
     ap.add_argument("--pomera-newline", default="lf", choices=["lf", "crlf"],
                     help="ポメラ側の改行コード（既定: lf）")
+    ap.add_argument("--no-rename-detect", action="store_true",
+                    help="リネーム／移動の検出を無効にする")
+    ap.add_argument("--rename-threshold", type=float, default=0.75,
+                    help="リネーム判定の類似度しきい値 0.0-1.0（既定: 0.75）")
     ap.add_argument("--ignore", default="",
                     help="追加で無視するフォルダ／ファイル名（カンマ区切り）")
     args = ap.parse_args(argv)
