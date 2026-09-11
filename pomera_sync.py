@@ -211,6 +211,35 @@ def merge_text(base_t, a_t, b_t):
 # -------------------------------------------------------------------- sync
 
 
+def prune_empty_dirs(root, ignore_names, dry=False):
+    """同期の結果、空になったディレクトリを下から順に削除する。
+
+    root 自身は消さない。無視対象（隠しフォルダ等）には触れない。
+    戻り値: 削除した相対パスのリスト
+    """
+    removed = []
+    if not os.path.isdir(root):
+        return removed
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+        if os.path.abspath(dirpath) == os.path.abspath(root):
+            continue
+        rel = os.path.relpath(dirpath, root).replace("\\", "/")
+        if ignored(rel, ignore_names):
+            continue
+        try:
+            if os.listdir(dirpath):
+                continue
+        except OSError:
+            continue
+        if not dry:
+            try:
+                os.rmdir(dirpath)
+            except OSError:
+                continue
+        removed.append(rel)
+    return removed
+
+
 class Sync(object):
 
     def __init__(self, args):
@@ -228,8 +257,9 @@ class Sync(object):
             x for x in args.ignore.split(",") if x)
         self.rename_detect = not args.no_rename_detect
         self.rename_threshold = args.rename_threshold
-        self.stats = {"new": 0, "update": 0, "merge": 0,
-                      "conflict": 0, "delete": 0, "skip": 0, "rename": 0}
+        self.prune_dirs = not args.keep_empty_dirs
+        self.stats = {"new": 0, "update": 0, "merge": 0, "conflict": 0,
+                      "delete": 0, "skip": 0, "rename": 0, "prune": 0}
 
     # ---- paths
 
@@ -492,12 +522,20 @@ class Sync(object):
         for key in sorted(table):
             self.handle(key, table[key])
 
+        if self.prune_dirs:
+            for side, root in (("ポメラ", self.pomera), ("vault", self.vault)):
+                for rel in prune_empty_dirs(root, self.ignore, self.dry):
+                    log("D  空フォルダを削除（%s）: %s" % (side, rel))
+                    self.stats["prune"] += 1
+
         log("")
         log("--- 結果 ---")
-        log("新規:%d  更新:%d  マージ:%d  移動:%d  衝突:%d  削除:%d  スキップ:%d"
+        log("新規:%d  更新:%d  マージ:%d  移動:%d  衝突:%d  削除:%d  "
+            "空フォルダ:%d  スキップ:%d"
             % (self.stats["new"], self.stats["update"], self.stats["merge"],
                self.stats["rename"], self.stats["conflict"],
-               self.stats["delete"], self.stats["skip"]))
+               self.stats["delete"], self.stats["prune"],
+               self.stats["skip"]))
         if self.dry:
             log("(dry-run のため実際の書き込みは行っていません)")
         if self.stats["conflict"]:
@@ -626,6 +664,8 @@ def main(argv=None):
                     help="リネーム／移動の検出を無効にする")
     ap.add_argument("--rename-threshold", type=float, default=0.75,
                     help="リネーム判定の類似度しきい値 0.0-1.0（既定: 0.75）")
+    ap.add_argument("--keep-empty-dirs", action="store_true",
+                    help="同期後に空になったフォルダを削除しない")
     ap.add_argument("--ignore", default="",
                     help="追加で無視するフォルダ／ファイル名（カンマ区切り）")
     args = ap.parse_args(argv)
