@@ -1,0 +1,103 @@
+# pomera_sync
+
+ポメラ（DM200）のSDカードと、Obsidian の vault を双方向同期するスクリプト。
+iPad の a-Shell（App Store・無料）上の Python 3 で動く。追加ライブラリ不要。
+
+## できること
+
+- ポメラ側の `.txt` と vault 側の `.md` を自動で相互変換して同期する
+- `.txt` / `.md` 以外の拡張子は変換せず、そのままの名前で同期する
+- 前回同期時の内容を保存しておき、両側が編集されていれば **3-way マージ**を試みる
+  - 別々の箇所を直していれば自動で統合される
+  - 同じ箇所を直していた場合のみ「衝突」とし、更新日時の新しい方を採用、
+    古い方は `名前.conflict-YYYYMMDD-HHMMSS.md` として隣に残す
+- 片側で削除されたファイルはもう一方からも削除する（ゴミ箱へ退避、実削除はしない）
+  - ただし、もう一方で編集されていた場合は削除せず復活させる
+- ポメラ側の文字コード・改行コードを指定できる（vault 側は常に UTF-8 / LF）
+- サブフォルダに対応。`.obsidian` などの隠しフォルダは同期しない
+
+## セットアップ（iPad / a-Shell）
+
+1. App Store で **a-Shell** を入れる
+2. `pomera_sync.py` を a-Shell のホームに置く
+   - 「ファイル」アプリの「このiPad内 → a-Shell」にコピーすればよい
+3. SDカードリーダーで SDカードを挿し、a-Shell で以下を実行
+
+   ```
+   pickFolder
+   ```
+
+   ファイルピッカーが開くので、SDカード内の同期したいフォルダを選ぶ。
+   選んだ場所はブックマークされるので、`showmarks` で名前を確認しておく。
+
+4. vault のパスを控える。Obsidian の vault が
+   「このiPad内 → Obsidian → MyVault」にあるなら、a-Shell で
+
+   ```
+   pickFolder      # ← vault を選ぶ
+   pwd             # ← 表示されたパスを控える
+   ```
+
+## 使い方
+
+SDカードのフォルダに移動してから実行する。
+
+```
+cd ~sd                                    # pickFolder で付いたブックマーク名
+python3 ~/Documents/pomera_sync.py . --vault /path/to/MyVault
+```
+
+まずは必ず `--dry-run` で確認する。
+
+```
+python3 ~/Documents/pomera_sync.py . --vault /path/to/MyVault --dry-run
+```
+
+### 文字コードを変える場合
+
+DM200 側が Shift_JIS / CRLF なら:
+
+```
+python3 ~/Documents/pomera_sync.py . --vault /path/to/MyVault \
+    --pomera-encoding cp932 --pomera-newline crlf
+```
+
+読み込みは既定で UTF-8 → CP932 の順に試すので、混在していても読める。
+
+### オプション
+
+| オプション | 既定値 | 説明 |
+| --- | --- | --- |
+| `--vault` | （必須） | Obsidian vault のパス |
+| `--state` | `~/Documents/.pomera_sync` | 同期状態とゴミ箱の保存先 |
+| `--dry-run` | off | 変更せず結果だけ表示 |
+| `--pomera-encoding` | `utf-8` | ポメラ側の書き出し文字コード |
+| `--pomera-read-encodings` | `utf-8-sig,cp932` | 読み込み時に試す順序 |
+| `--pomera-newline` | `lf` | `lf` または `crlf` |
+| `--ignore` | なし | 追加で無視する名前（カンマ区切り） |
+
+## 仕組み（マージが効く理由）
+
+`--state` の下に、前回同期が完了した時点の内容（ベース）を保存している。
+次の同期では「ベース → ポメラ」「ベース → vault」の差分を両方求め、
+base 上で重ならない変更は両方適用する。重なった場合だけ衝突として扱う。
+
+このため、**同期を挟まずに両側を編集しても、違う段落を直していれば失われない**。
+
+## 注意
+
+- 初回同期の前に、SDカードと vault のバックアップを取っておくこと
+- ベース（`--state`）を消すと 3-way マージができなくなり、以後の衝突は
+  すべて「新しい方を採用」になる。消さないこと
+- SDカードの抜き差しでマウントパスが変わることがある。その場合は
+  もう一度 `pickFolder` で選び直す
+- 同じ名前で `a.txt` と `a.md` が同じ側にあると、対応づけできないためスキップする
+
+## テスト
+
+```
+python3 test_sync.py
+```
+
+拡張子変換、3-way マージ、衝突処理、削除の伝播、文字コード変換、
+サブフォルダ、べき等性など 12 シナリオを検証する。
