@@ -258,19 +258,35 @@ class Sync(object):
         self.rename_detect = not args.no_rename_detect
         self.rename_threshold = args.rename_threshold
         self.prune_dirs = not args.keep_empty_dirs
+        # テキストの拡張子はキーごとに解決する。
+        # ポメラ側は原則 .txt、vault 側は既定 .md だが、
+        # 既に .txt で存在しているものはその拡張子を保持する。
+        self.p_ext = {}
+        self.v_ext = {}
+        self.v_ext_fixed = set()
         self.stats = {"new": 0, "update": 0, "merge": 0, "conflict": 0,
                       "delete": 0, "skip": 0, "rename": 0, "prune": 0}
 
     # ---- paths
 
+    def p_name(self, key, is_text):
+        if not is_text:
+            return key[2:]
+        return key[2:] + self.p_ext.get(key, ".txt")
+
+    def v_name(self, key, is_text):
+        if not is_text:
+            return key[2:]
+        return key[2:] + self.v_ext.get(key, ".md")
+
     def p_path(self, key, is_text):
-        return os.path.join(self.pomera, key_to_name(key, is_text, "pomera"))
+        return os.path.join(self.pomera, self.p_name(key, is_text))
 
     def v_path(self, key, is_text):
-        return os.path.join(self.vault, key_to_name(key, is_text, "vault"))
+        return os.path.join(self.vault, self.v_name(key, is_text))
 
     def b_path(self, key, is_text):
-        return os.path.join(self.base_dir, key_to_name(key, is_text, "vault"))
+        return os.path.join(self.base_dir, self.v_name(key, is_text))
 
     # ---- io
 
@@ -376,15 +392,43 @@ class Sync(object):
         dupes = []
         for side, root in (("pomera", self.pomera), ("vault", self.vault)):
             seen = {}
-            for rel in scan(root, self.ignore):
+            # 同じキーに .md と .txt が並ぶ場合の優先順を固定する
+            for rel in sorted(scan(root, self.ignore)):
                 key, is_text = split_key(rel)
+                ext = os.path.splitext(rel)[1].lower()
                 if key in seen and seen[key] != rel:
-                    dupes.append((side, seen[key], rel))
+                    prev_ext = os.path.splitext(seen[key])[1].lower()
+                    prefer = ".md" if side == "vault" else ".txt"
+                    if ext == prefer and prev_ext != prefer:
+                        dupes.append((side, rel, seen[key]))
+                        seen[key] = rel
+                        if is_text:
+                            self._set_ext(side, key, ext)
+                    else:
+                        dupes.append((side, seen[key], rel))
                     continue
                 seen[key] = rel
+                if is_text:
+                    self._set_ext(side, key, ext)
                 entry = table.setdefault(key, {"is_text": is_text})
                 entry[side] = True
         return table, dupes
+
+    def _set_ext(self, side, key, ext):
+        if side == "pomera":
+            self.p_ext[key] = ext
+        else:
+            self.v_ext[key] = ext
+            self.v_ext_fixed.add(key)
+
+    def resolve_base_exts(self):
+        """vault 側に実体が無いキーは、ベースに残っている拡張子を引き継ぐ。"""
+        for rel in scan(self.base_dir, self.ignore):
+            key, is_text = split_key(rel)
+            if not is_text or key in self.v_ext_fixed:
+                continue
+            self.v_ext[key] = os.path.splitext(rel)[1].lower()
+            self.v_ext_fixed.add(key)
 
     # ---- rename / move detection
 
@@ -478,9 +522,17 @@ class Sync(object):
 
     def apply_rename(self, side, old_key, new_key, table, score):
         is_text = table[old_key]["is_text"]
-        old_name = key_to_name(old_key, is_text, "vault")
-        new_name = key_to_name(new_key, is_text, "vault")
+        old_name = self.v_name(old_key, is_text)
+        old_base = self.b_path(old_key, is_text)
+        # 移動先の拡張子が未確定なら、移動元の拡張子を引き継ぐ
+        if is_text and new_key not in self.v_ext_fixed:
+            self.v_ext[new_key] = self.v_ext.get(old_key, ".md")
+            self.v_ext_fixed.add(new_key)
+        if is_text and new_key not in self.p_ext:
+            self.p_ext[new_key] = self.p_ext.get(old_key, ".txt")
+        new_name = self.v_name(new_key, is_text)
         kind = "移動" if score >= 1.0 else "移動+編集"
+        self.move(old_base, self.b_path(new_key, is_text))
 
         if side == "pomera":
             log("R  %s（ポメラ側）→ vault も追随: %s -> %s"
@@ -495,14 +547,13 @@ class Sync(object):
         else:
             log("R  %s（両側）: %s -> %s" % (kind, old_name, new_name))
 
-        self.move(self.b_path(old_key, is_text),
-                  self.b_path(new_key, is_text))
         table.pop(old_key, None)
         self.stats["rename"] += 1
 
     def run(self):
         ensure_dir(self.base_dir)
         table, dupes = self.collect()
+        self.resolve_base_exts()
 
         for side, a, b in dupes:
             log("!  重複のためスキップ (%s): %s / %s" % (side, a, b))
@@ -546,7 +597,7 @@ class Sync(object):
         has_p = os.path.exists(self.p_path(key, is_text))
         has_v = os.path.exists(self.v_path(key, is_text))
         base = self.read_b(key, is_text)
-        name = key_to_name(key, is_text, "vault")
+        name = self.v_name(key, is_text)
 
         # --- どちらも無い
         if not has_p and not has_v:
