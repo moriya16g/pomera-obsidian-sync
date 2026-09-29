@@ -353,6 +353,34 @@ os.remove(os.path.join(V, "d.txt"))
 sync()
 check("ポメラからも消える", not os.path.exists(os.path.join(P, "d.txt")))
 
+
+print("\n[31] macOS 由来の NFD ファイル名を NFC に揃えて同一視する")
+reset()
+import unicodedata as _u
+w(P, "ぽめら原稿.txt", "本文\n")
+sync()
+# macOS で触られて NFD 名になった状況を再現
+nfd = _u.normalize("NFD", "ぽめら原稿.txt")
+os.rename(os.path.join(P, "ぽめら原稿.txt"), os.path.join(P, nfd))
+w(P, nfd, "本文\n加筆\n")
+sync()
+names = sorted(os.listdir(P))
+check("SD に1ファイルだけ", names == ["ぽめら原稿.txt"], str([_u.normalize("NFC", n) + "/" + str(len(n)) for n in names]))
+check("vault も1ファイルだけ", sorted(os.listdir(V)) == ["ぽめら原稿.md"], str(sorted(os.listdir(V))))
+check("加筆が反映", r(V, "ぽめら原稿.md") == "本文\n加筆\n")
+
+print("\n[32] NFD のフォルダ名も揃う")
+reset()
+w(V, _u.normalize("NFD", "序章ぱーと/a.md"), "本文\n")
+sync()
+check("SD 側が NFC", sorted(os.listdir(P)) == ["序章ぱーと"], str(sorted(os.listdir(P))))
+
+print("\n[33] --no-normalize-names で従来動作")
+reset()
+w(P, _u.normalize("NFD", "ぽめら.txt"), "本文\n")
+sync(["--no-normalize-names"])
+check("正規化されない", os.listdir(P)[0] != "ぽめら.txt")
+
 shutil.rmtree(ROOT)
 print("\n===== %s =====" % ("全て成功" if not fails else "失敗: %s" % fails))
 sys.exit(1 if fails else 0)

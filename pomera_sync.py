@@ -21,6 +21,7 @@ import os
 import shutil
 import sys
 import time
+import unicodedata
 
 TEXT_EXTS = {".txt", ".md"}
 DEFAULT_IGNORE = [
@@ -211,6 +212,37 @@ def merge_text(base_t, a_t, b_t):
 # -------------------------------------------------------------------- sync
 
 
+def normalize_names(root, ignore_names, dry=False):
+    """ファイル名・フォルダ名を Unicode NFC に揃える。
+
+    macOS は濁点付きの日本語名を分解形（NFD）で保存することがあり、
+    他OSで作った同名ファイルと別物として扱われてしまう。
+    同期前に一度揃えておくと、環境をまたいでも同一視できる。
+    """
+    renamed = []
+    if not os.path.isdir(root):
+        return renamed
+    for dirpath, dirnames, filenames in os.walk(root, topdown=False):
+        for name in filenames + dirnames:
+            fixed = unicodedata.normalize("NFC", name)
+            if fixed == name:
+                continue
+            src = os.path.join(dirpath, name)
+            dst = os.path.join(dirpath, fixed)
+            rel = os.path.relpath(src, root).replace("\\", "/")
+            if ignored(rel, ignore_names):
+                continue
+            if os.path.exists(dst):
+                continue
+            if not dry:
+                try:
+                    os.rename(src, dst)
+                except OSError:
+                    continue
+            renamed.append((rel, fixed))
+    return renamed
+
+
 def prune_empty_dirs(root, ignore_names, dry=False):
     """同期の結果、空になったディレクトリを下から順に削除する。
 
@@ -258,6 +290,7 @@ class Sync(object):
         self.rename_detect = not args.no_rename_detect
         self.rename_threshold = args.rename_threshold
         self.prune_dirs = not args.keep_empty_dirs
+        self.normalize = not args.no_normalize_names
         # テキストの拡張子はキーごとに解決する。
         # ポメラ側は原則 .txt、vault 側は既定 .md だが、
         # 既に .txt で存在しているものはその拡張子を保持する。
@@ -265,7 +298,8 @@ class Sync(object):
         self.v_ext = {}
         self.v_ext_fixed = set()
         self.stats = {"new": 0, "update": 0, "merge": 0, "conflict": 0,
-                      "delete": 0, "skip": 0, "rename": 0, "prune": 0}
+                      "delete": 0, "skip": 0, "rename": 0, "prune": 0,
+                      "normalize": 0}
 
     # ---- paths
 
@@ -552,6 +586,15 @@ class Sync(object):
 
     def run(self):
         ensure_dir(self.base_dir)
+
+        if self.normalize:
+            for label, root in (("ポメラ", self.pomera), ("vault", self.vault),
+                                ("base", self.base_dir)):
+                for rel, fixed in normalize_names(root, self.ignore, self.dry):
+                    log("N  名前を NFC に正規化（%s）: %s -> %s"
+                        % (label, rel, fixed))
+                    self.stats["normalize"] += 1
+
         table, dupes = self.collect()
         self.resolve_base_exts()
 
@@ -715,6 +758,8 @@ def main(argv=None):
                     help="リネーム／移動の検出を無効にする")
     ap.add_argument("--rename-threshold", type=float, default=0.75,
                     help="リネーム判定の類似度しきい値 0.0-1.0（既定: 0.75）")
+    ap.add_argument("--no-normalize-names", action="store_true",
+                    help="ファイル名の Unicode 正規化（NFC 統一）を行わない")
     ap.add_argument("--keep-empty-dirs", action="store_true",
                     help="同期後に空になったフォルダを削除しない")
     ap.add_argument("--ignore", default="",
